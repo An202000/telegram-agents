@@ -13,47 +13,49 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     print("❌ خطأ: يرجى التحقق من المتغيرات في Railway")
     exit(1)
 
+# إعداد المكتبة
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ============ إضافة أدوات البحث (Tools) ============
-# تم إضافة خاصية google_search_retrieval لتمكين البوت من تصفح الإنترنت
-tools = [
-    { "google_search_retrieval": {} }
-]
-
+# ============ إعداد النموذج مع البحث (المسار الصحيح) ============
+# ملاحظة: تم تعديل طريقة تعريف الأداة لتجنب خطأ 404
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    tools=tools
+    model_name='models/gemini-1.5-flash', # استخدام الاسم الكامل للموديل
+    tools=[{"google_search_retrieval": {}}]
 )
 
 # ============ الوكلاء ============
 AGENTS = [
-    {"name": "🔍 باحث_أول - أحمد", "role": "خبير البحث في الويب وجلب الأخبار الحقيقية"},
-    {"name": "🤖 محلل_بيانات - سارة", "role": "متخصصة في تحليل الأرقام والبيانات التقنية"},
-    {"name": "🌐 باحث_ويب - خالد", "role": "خبير في استخدام الـ APIs والمصادر المفتوحة"},
-    {"name": "📊 استراتيجي - منى", "role": "خبير التخطيط وربط المعلومات ببعضها"},
-    {"name": "⚡ مطور_أتمتة - يوسف", "role": "خبير البرمجة وكتابة الأكواد"}
+    {"name": "🔍 باحث_أول - أحمد", "role": "خبير البحث في الويب"},
+    {"name": "🤖 محلل_بيانات - سارة", "role": "خبير التحليل"},
+    {"name": "🌐 باحث_ويب - خالد", "role": "خبير الـ APIs"},
+    {"name": "📊 استراتيجي - منى", "role": "خبير التخطيط"},
+    {"name": "⚡ مطور_أتمتة - يوسف", "role": "خبير الأكواد"}
 ]
 
 conversation_history = []
 discussion_active = False
 
-async def get_ai_response(prompt, use_search=True):
+async def get_ai_response(prompt):
     try:
-        # إذا كان الطلب يحتاج بحث، سيقوم Gemini باستخدام جوجل تلقائياً
+        # التوليد مع تفعيل البحث
         response = await asyncio.to_thread(model.generate_content, prompt)
         return response.text.strip()
     except Exception as e:
-        return f"عذراً، واجهت مشكلة في الاتصال بالمصادر الخارجية: {e}"
+        # إذا فشل البحث، نحاول التوليد العادي كخطة بديلة
+        print(f"Search Error: {e}")
+        try:
+            fallback_model = genai.GenerativeModel('models/gemini-1.5-flash')
+            response = await asyncio.to_thread(fallback_model.generate_content, prompt)
+            return response.text.strip()
+        except:
+            return "عذراً، أواجه صعوبة في الوصول للمعلومات حالياً."
 
 async def handle_user_command(bot, chat_id, user_text):
-    """هذه الدالة تجعل الوكلاء يبحثون وينفذون طلبك"""
     await bot.send_chat_action(chat_id=chat_id, action="typing")
     
-    prompt = f"""المستخدم أرسل أمراً: "{user_text}"
-بصفتكم فريق عمل (أحمد، سارة، خالد، منى، يوسف).
-إذا كان الطلب يحتاج معلومات حديثة (أسعار، أخبار، طقس)، استخدم أداة البحث في جوجل فوراً.
-قدم الإجابة بدقة مع ذكر المصادر إن وجدت، وصغ الرد باسم الوكيل الأنسب."""
+    prompt = f"""أنت فريق وكلاء ذكاء اصطناعي. المستخدم أرسل: "{user_text}".
+استخدم البحث في جوجل إذا كان الطلب يتطلب معلومات حديثة.
+أجب بلسان الوكيل الأنسب للمهمة وكن دقيقاً جداً."""
     
     response = await get_ai_response(prompt)
     await bot.send_message(chat_id=chat_id, text=f"✅ **تم التنفيذ:**\n\n{response}", parse_mode="Markdown")
@@ -62,24 +64,18 @@ async def run_discussion(bot, chat_id):
     global discussion_active
     while discussion_active:
         agent = random.choice(AGENTS)
-        history = "\n".join(conversation_history[-3:])
-        prompt = f"أنت {agent['name']}. ناقش زملائك باختصار في أتمتة البحث. السياق الحالي: {history}"
-        
-        response = await get_ai_response(prompt, use_search=False)
-        msg = f"*{agent['name']}:*\n{response}"
-        
+        prompt = f"أنت {agent['name']}. أعطِ فكرة مختصرة عن أتمتة البحث."
+        response = await get_ai_response(prompt)
         try:
-            await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-            conversation_history.append(f"{agent['name']}: {response}")
+            await bot.send_message(chat_id=chat_id, text=f"*{agent['name']}:*\n{response}", parse_mode="Markdown")
         except: break
-        
-        await asyncio.sleep(random.randint(40, 80))
+        await asyncio.sleep(random.randint(60, 120))
 
 async def main():
     global discussion_active
     bot = Bot(token=TELEGRAM_TOKEN)
     last_update_id = None
-    print("🚀 البوت الآن مزود بمحرك بحث جوجل...")
+    print("🚀 البوت يعمل الآن مع محرك بحث مصحح...")
 
     while True:
         try:
@@ -96,10 +92,9 @@ async def main():
                     asyncio.create_task(run_discussion(bot, chat_id))
                 elif text == "/stop":
                     discussion_active = False
-                    await bot.send_message(chat_id=chat_id, text="⏹ توقف النقاش الجانبي. أنا بانتظار أوامرك للبحث.")
+                    await bot.send_message(chat_id=chat_id, text="⏹ توقف النقاش.")
                 else:
                     await handle_user_command(bot, chat_id, text)
-
         except Exception as e:
             await asyncio.sleep(5)
 
