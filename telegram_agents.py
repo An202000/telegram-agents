@@ -17,7 +17,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 # ============ 2. وظيفة إنشاء النموذج (بدون tools خارجية) ============
 def create_model():
-    return genai.GenerativeModel(model_name='gemini-1.5-flash')
+    return genai.GenerativeModel(model_name='gemini-2.0-flash')
 
 # ============ 3. البحث الحقيقي عبر DuckDuckGo ============
 async def search_web(query: str, max_results: int = 5) -> str:
