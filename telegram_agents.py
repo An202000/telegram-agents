@@ -6,6 +6,9 @@ import re
 import base64
 import sqlite3
 import hashlib
+import subprocess
+import tempfile
+import sys
 from groq import Groq
 from telegram import Bot
 from telegram.error import TelegramError
@@ -22,28 +25,42 @@ client  = Groq(api_key=GROQ_API_KEY)
 DB_PATH = "/app/memory.db"
 
 # ================================================================
-# 2. قاعدة البيانات  (ذاكرة دائمة + RAG + ملخصات)
+# 2. الوكلاء الثلاثة
+# ================================================================
+AGENTS = {
+    "الباحث": {
+        "emoji": "🔍",
+        "personality": "باحث دقيق يلخص السؤال ويستخرج المعلومات من الإنترنت، يقدم السياق الكامل للفريق"
+    },
+    "المبرمج": {
+        "emoji": "💻",
+        "personality": "مبرمج محترف يكتب كوداً نظيفاً بدون أخطاء، يستخدم أفضل الممارسات، يشرح الكود خطوة بخطوة"
+    },
+    "المنفذ": {
+        "emoji": "⚡",
+        "personality": "منفذ أوامر متخصص، ينفذ الكود ويشغل الأوامر ويتعامل مع APIs الخارجية ويبلغ بالنتيجة الفعلية"
+    },
+}
+
+# ================================================================
+# 3. قاعدة البيانات (ذاكرة دائمة + RAG + ملخصات)
 # ================================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # رسائل المحادثة
     c.execute("""CREATE TABLE IF NOT EXISTS messages
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   chat_id INTEGER, role TEXT, content TEXT,
                   ts DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-    # ملخصات دورية
     c.execute("""CREATE TABLE IF NOT EXISTS summaries
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   chat_id INTEGER, summary TEXT,
                   ts DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-    # قاعدة المعرفة RAG
     c.execute("""CREATE TABLE IF NOT EXISTS knowledge
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   chat_id INTEGER, title TEXT, content TEXT,
                   hash TEXT UNIQUE,
                   ts DATETIME DEFAULT CURRENT_TIMESTAMP)""")
-    # دروس مستفادة
     c.execute("""CREATE TABLE IF NOT EXISTS lessons
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   chat_id INTEGER, lesson TEXT,
@@ -57,12 +74,10 @@ def save_msg(chat_id, role, content):
     c = conn.cursor()
     c.execute("INSERT INTO messages (chat_id,role,content) VALUES (?,?,?)",
               (chat_id, role, content))
-    # احتفظ بآخر 60 رسالة
     c.execute("""DELETE FROM messages WHERE chat_id=? AND id NOT IN
                  (SELECT id FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT 60)""",
               (chat_id, chat_id))
     conn.commit()
-    # كل 20 رسالة → اصنع ملخصاً
     c.execute("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))
     count = c.fetchone()[0]
     conn.close()
@@ -166,32 +181,13 @@ def clear_all(chat_id):
     conn.close()
 
 # ================================================================
-# 3. الوكلاء مع شخصيات واضحة
+# 4. أدوات مساعدة
 # ================================================================
-AGENTS = [
-    {"name": "أحمد",  "emoji": "🔍",
-     "personality": "باحث دقيق يحب الحقائق والأدلة، يشكك في الأفكار السطحية"},
-    {"name": "سارة",  "emoji": "🤖",
-     "personality": "محللة بيانات تفكر بالأرقام والإحصاءات، تبحث عن الأنماط"},
-    {"name": "خالد",  "emoji": "🌐",
-     "personality": "خبير تقني عملي، يفكر في التطبيق والتنفيذ الفعلي"},
-    {"name": "منى",   "emoji": "📊",
-     "personality": "استراتيجية تفكر في الصورة الكبيرة والعواقب بعيدة المدى"},
-    {"name": "يوسف",  "emoji": "⚡",
-     "personality": "مطور إبداعي يبحث عن حلول غير تقليدية وأتمتة ذكية"},
-]
+def truncate(text: str, max_chars: int = 6000) -> str:
+    if len(text) > max_chars:
+        return text[:max_chars] + "\n... [تم اختصار السياق]"
+    return text
 
-# ================================================================
-# 4. المتغيرات العامة
-# ================================================================
-discussion_history: list[str] = []
-discussion_active  = False
-discussion_task: asyncio.Task | None = None
-chat_id_global: int | None = None
-
-# ================================================================
-# 5. أدوات مساعدة
-# ================================================================
 async def safe_send(bot: Bot, chat_id: int, text: str):
     if not text:
         return
@@ -202,7 +198,7 @@ async def safe_send(bot: Bot, chat_id: int, text: str):
     except Exception as e:
         print(f"Send error: {e}")
 
-async def groq_call(prompt: str, system: str, max_tokens=600, temp=0.7) -> str:
+async def groq_call(prompt: str, system: str, max_tokens=800, temp=0.5) -> str:
     try:
         r = await asyncio.to_thread(
             lambda: client.chat.completions.create(
@@ -225,13 +221,6 @@ async def web_search(query: str, n=5) -> str:
     except Exception as e:
         print(f"Search error: {e}")
         return ""
-
-async def search_images(query: str) -> list[str]:
-    try:
-        res = await asyncio.to_thread(lambda: list(DDGS().images(query, max_results=3)))
-        return [r.get("image","") for r in res if r.get("image")]
-    except:
-        return []
 
 async def transcribe_voice(audio_bytes: bytes) -> str:
     try:
@@ -265,15 +254,13 @@ async def analyze_image(img_bytes: bytes, question="صف هذه الصورة ب�
         return ""
 
 # ================================================================
-# 6. بناء السياق الكامل (ذاكرة عميقة)
+# 5. بناء السياق الكامل
 # ================================================================
 def build_context(chat_id: int, query: str = "") -> str:
     ctx = ""
-    # ملخصات قديمة
     summaries = get_summaries(chat_id)
     if summaries:
         ctx += f"=== ملخص المحادثات السابقة ===\n{summaries}\n\n"
-    # RAG
     if query:
         docs = search_knowledge(chat_id, query)
         if docs:
@@ -281,18 +268,16 @@ def build_context(chat_id: int, query: str = "") -> str:
             for title, content in docs:
                 ctx += f"[{title}]: {content[:400]}\n"
             ctx += "\n"
-    # دروس
     lessons = get_lessons(chat_id)
     if lessons:
         ctx += f"=== دروس مستفادة ===\n{lessons}\n\n"
-    # رسائل أخيرة
     recent = get_recent_msgs(chat_id, 10)
     if recent:
         ctx += f"=== المحادثة الأخيرة ===\n{recent}\n"
-    return ctx
+    return truncate(ctx, 5000)
 
 # ================================================================
-# 7. تلخيص تلقائي كل 20 رسالة
+# 6. تلخيص تلقائي كل 20 رسالة
 # ================================================================
 async def maybe_summarize(chat_id: int, msg_count: int):
     if msg_count > 0 and msg_count % 20 == 0:
@@ -306,204 +291,221 @@ async def maybe_summarize(chat_id: int, msg_count: int):
             save_summary(chat_id, summary)
 
 # ================================================================
-# 8. التعاون الحقيقي بين الوكلاء (قلب النظام)
+# 7. تنفيذ الكود الفعلي (المنفذ)
 # ================================================================
-async def agents_collaborate(bot: Bot, chat_id: int, question: str, context: str) -> str:
-    """
-    كل وكيل يقرأ آراء السابقين ويبني عليها أو يعارضها،
-    ثم يوسف (المطور) يصنع الرد النهائي المتكامل.
-    """
-    await safe_send(bot, chat_id, "🤝 الوكلاء يتشاورون...")
-    
-    opinions: list[str] = []
-    
-    # كل وكيل (عدا الأخير) يبدي رأيه
-    for agent in AGENTS[:-1]:
-        prev = "\n".join(f"- {op}" for op in opinions) if opinions else "لا يوجد آراء سابقة"
-        opinion = await groq_call(
-            f"""السياق:
-{context}
+async def execute_code(code: str) -> str:
+    """ينفذ كود Python في بيئة آمنة ويعيد النتيجة"""
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py',
+                                         delete=False, encoding='utf-8') as f:
+            f.write(code)
+            tmp_path = f.name
 
-السؤال/المهمة: {question}
-
-آراء زملائك حتى الآن:
-{prev}
-
-أبدِ رأيك من منظورك الخاص. يمكنك الموافقة أو الاختلاف أو الإضافة. جملتان أو ثلاث.""",
-            f"أنت {agent['name']}، {agent['personality']}. أبدِ رأيك بصدق من منظورك.",
-            200, 0.8
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                [sys.executable, tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=30,  # 30 ثانية كحد أقصى
+                encoding='utf-8'
+            )
         )
-        if opinion:
-            opinions.append(f"{agent['emoji']} {agent['name']}: {opinion}")
-            await safe_send(bot, chat_id, f"{agent['emoji']} {agent['name']}:\n{opinion}")
-            await asyncio.sleep(0.5)
-    
-    # يوسف يصنع الرد النهائي المتكامل
-    all_opinions = "\n\n".join(opinions)
-    final = await groq_call(
-        f"""السياق:
-{context}
+        os.unlink(tmp_path)
 
-السؤال/المهمة: {question}
+        output = ""
+        if result.stdout:
+            output += f"✅ الناتج:\n{result.stdout}"
+        if result.stderr:
+            output += f"\n⚠️ أخطاء:\n{result.stderr}"
+        return output.strip() or "✅ تم التنفيذ بنجاح (لا يوجد ناتج)"
 
-آراء الفريق:
-{all_opinions}
+    except subprocess.TimeoutExpired:
+        return "❌ انتهت مهلة التنفيذ (30 ثانية)"
+    except Exception as e:
+        return f"❌ خطأ في التنفيذ: {e}"
 
-بناءً على كل ما سبق، اصنع إجابة نهائية شاملة ومتكاملة تأخذ أفضل ما في كل رأي.""",
-        f"أنت {AGENTS[-1]['name']}، {AGENTS[-1]['personality']}. اصنع الرد النهائي الأفضل.",
-        800, 0.6
-    )
-    return final
+async def execute_shell(command: str) -> str:
+    """ينفذ أمر shell"""
+    try:
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                command, shell=True,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                encoding='utf-8'
+            )
+        )
+        output = ""
+        if result.stdout:
+            output += f"✅ الناتج:\n{result.stdout}"
+        if result.stderr:
+            output += f"\n⚠️ أخطاء:\n{result.stderr}"
+        return output.strip() or "✅ تم التنفيذ"
+    except subprocess.TimeoutExpired:
+        return "❌ انتهت مهلة التنفيذ"
+    except Exception as e:
+        return f"❌ خطأ: {e}"
 
-# ================================================================
-# 9. التفكير متعدد المراحل (Chain of Thought)
-# ================================================================
-async def chain_of_thought(question: str, context: str) -> str:
-    """يفكر أولاً ثم يحسّن إجابته"""
-    # المرحلة 1: تفكير أولي
-    draft = await groq_call(
-        f"السياق:\n{context}\n\nالسؤال: {question}\n\nفكّر بصوت عالٍ خطوة بخطوة:",
-        "أنت مساعد يفكر بعمق. اعرض تفكيرك بالتفصيل.",
-        400, 0.7
-    )
-    # المرحلة 2: تقييم ذاتي
-    critique = await groq_call(
-        f"هذا تفكيري الأولي:\n{draft}\n\nما نقاط ضعفه؟ ما الذي فاته؟",
-        "أنت ناقد ذكي تجد الثغرات في التفكير.",
-        200, 0.6
-    )
-    # المرحلة 3: الرد المحسّن
-    final = await groq_call(
-        f"""السياق:\n{context}
-السؤال: {question}
-التفكير الأولي: {draft}
-نقد التفكير: {critique}
+def extract_code_block(text: str) -> str:
+    """يستخرج الكود من ```python ... ```"""
+    pattern = r"```(?:python|bash|sh)?\n?(.*?)```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    return matches[0].strip() if matches else ""
 
-الآن أعطِ الإجابة النهائية المحسّنة:""",
-        "أنت مساعد ذكي يقدم أفضل إجابة ممكنة بعد التفكير العميق.",
-        600, 0.6
-    )
-    return final
+def extract_shell_command(text: str) -> str:
+    """يستخرج أوامر الـ shell من ```bash ... ```"""
+    pattern = r"```(?:bash|sh)\n?(.*?)```"
+    matches = re.findall(pattern, text, re.DOTALL)
+    return matches[0].strip() if matches else ""
 
 # ================================================================
-# 10. الوكيل الرئيسي (يجمع كل شيء)
+# 8. الوكيل الرئيسي - تعاون الثلاثة
+# ================================================================
+async def run_three_agents(bot: Bot, chat_id: int, user_input: str, ctx: str):
+    """
+    الباحث → يلخص ويبحث
+    المبرمج → يكتب الكود
+    المنفذ → ينفذ ويبلغ بالنتيجة
+    """
+
+    # ──────────────────────────────────────────
+    # الخطوة 1: الباحث يلخص ويبحث
+    # ──────────────────────────────────────────
+    await safe_send(bot, chat_id, "🔍 الباحث يحلل ويبحث...")
+
+    # تلخيص السؤال واستخراج كلمات البحث
+    search_keywords = await groq_call(
+        f"استخرج كلمات بحث مناسبة (3-5 كلمات) من هذا الطلب: {user_input}",
+        "أخرج كلمات البحث فقط بدون شرح.",
+        50
+    )
+
+    search_results = await web_search(search_keywords or user_input, 4)
+
+    researcher_summary = await groq_call(
+        f"""السياق السابق:
+{ctx}
+
+طلب المستخدم: {user_input}
+
+نتائج البحث:
+{search_results[:1500] if search_results else "لا يوجد نتائج"}
+
+قدم:
+1. ملخص واضح للمطلوب
+2. المعلومات المفيدة من البحث
+3. ما يحتاجه المبرمج لإنجاز المهمة""",
+        f"أنت الباحث، {AGENTS['الباحث']['personality']}.",
+        400
+    )
+
+    if researcher_summary:
+        await safe_send(bot, chat_id,
+            f"{AGENTS['الباحث']['emoji']} الباحث:\n{researcher_summary}")
+
+    # ──────────────────────────────────────────
+    # الخطوة 2: المبرمج يكتب الكود
+    # ──────────────────────────────────────────
+    await safe_send(bot, chat_id, "💻 المبرمج يكتب الكود...")
+
+    programmer_code = await groq_call(
+        f"""ملخص الباحث:
+{researcher_summary}
+
+السياق:
+{ctx}
+
+الطلب الأصلي: {user_input}
+
+اكتب كوداً Python نظيفاً وكاملاً وقابلاً للتنفيذ مباشرة.
+- تأكد من عدم وجود أخطاء
+- أضف معالجة للاستثناءات
+- اجعل الكود واضحاً مع تعليقات
+- ضع الكود داخل ```python ... ```""",
+        f"أنت المبرمج، {AGENTS['المبرمج']['personality']}. اكتب كوداً بدون أخطاء.",
+        1000, 0.3
+    )
+
+    if programmer_code:
+        await safe_send(bot, chat_id,
+            f"{AGENTS['المبرمج']['emoji']} المبرمج:\n{programmer_code}")
+
+    # ──────────────────────────────────────────
+    # الخطوة 3: المنفذ ينفذ ويبلغ
+    # ──────────────────────────────────────────
+    await safe_send(bot, chat_id, "⚡ المنفذ يشغّل الكود...")
+
+    # استخراج الكود وتنفيذه
+    code_to_run = extract_code_block(programmer_code or "")
+    shell_cmd   = extract_shell_command(programmer_code or "")
+
+    execution_result = ""
+
+    if code_to_run:
+        execution_result = await execute_code(code_to_run)
+    elif shell_cmd:
+        execution_result = await execute_shell(shell_cmd)
+    else:
+        # لو مافي كود قابل للتنفيذ، المنفذ يشرح الخطوات
+        execution_result = await groq_call(
+            f"""الكود المقترح من المبرمج:
+{programmer_code}
+
+الطلب: {user_input}
+
+بما أنه لا يوجد كود قابل للتنفيذ مباشرة، اشرح:
+1. كيف تنفذ هذا يدوياً خطوة بخطوة
+2. ما الأوامر التي يجب تشغيلها
+3. ما النتيجة المتوقعة""",
+            f"أنت المنفذ، {AGENTS['المنفذ']['personality']}.",
+            400
+        )
+
+    await safe_send(bot, chat_id,
+        f"{AGENTS['المنفذ']['emoji']} المنفذ:\n{execution_result}")
+
+    return execution_result
+
+# ================================================================
+# 9. الوكيل الرئيسي الذكي
 # ================================================================
 async def master_agent(bot: Bot, chat_id: int, user_input: str):
     count = save_msg(chat_id, "المستخدم", user_input)
     asyncio.create_task(maybe_summarize(chat_id, count))
-    
+
     ctx = build_context(chat_id, user_input)
-    
-    # تحديد نوع المهمة
-    is_complex = len(user_input) > 30 or any(
-        w in user_input for w in ["قارن","حلل","خطط","ابحث عن","اشرح","كيف","لماذا","ما الفرق"]
-    )
-    needs_images = any(w in user_input for w in ["صورة","صور","أرني","اعرض"])
-    needs_search = any(w in user_input for w in ["ابحث","اجلب","أخبار","سعر","أحدث","حديث"])
-    
-    search_ctx = ""
-    if needs_search:
-        await safe_send(bot, chat_id, "🔍 جاري البحث في الإنترنت...")
-        search_q = await groq_call(f"استخرج كلمات البحث من: {user_input}", "أخرج كلمات البحث فقط.", 50)
-        search_ctx = await web_search(search_q)
-        if search_ctx:
-            ctx += f"\n=== نتائج البحث ===\n{search_ctx[:800]}\n"
-    
-    if is_complex:
-        # تعاون حقيقي + تفكير عميق
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        collab_result = await agents_collaborate(bot, chat_id, user_input, ctx)
-        
-        # تحسين الرد بـ Chain of Thought
-        final = await chain_of_thought(user_input, ctx + f"\nرأي الفريق:\n{collab_result}")
-        response = final if final else collab_result
+
+    # هل يحتاج تعاون الثلاثة؟
+    needs_team = any(w in user_input for w in [
+        "كود", "برمجة", "سكريبت", "script", "python", "اكتب", "برنامج",
+        "أتمتة", "تنفيذ", "شغّل", "حل", "خطأ", "error", "bug",
+        "api", "قاعدة بيانات", "ملف", "استخرج", "حوّل"
+    ]) or len(user_input) > 40
+
+    if needs_team:
+        await run_three_agents(bot, chat_id, user_input, ctx)
     else:
-        # رد سريع من وكيل واحد
-        agent = random.choice(AGENTS)
+        # رد سريع من الباحث
         response = await groq_call(
             f"السياق:\n{ctx}\n\nالسؤال: {user_input}",
-            f"أنت {agent['name']}، {agent['personality']}. أجب بشكل مباشر ومفيد.",
+            f"أنت الباحث، {AGENTS['الباحث']['personality']}. أجب بشكل مباشر ومفيد.",
             500
         )
-        await safe_send(bot, chat_id, f"{agent['emoji']} {agent['name']}:")
-    
-    if response:
-        await safe_send(bot, chat_id, response)
-        save_msg(chat_id, "الوكيل", response)
-        save_lesson(chat_id, f"أجبت على: {user_input[:60]}")
-    
-    # جلب الصور إذا طُلبت
-    if needs_images:
-        urls = await search_images(user_input)
-        for url in urls[:3]:
-            try:
-                await bot.send_photo(chat_id=chat_id, photo=url)
-            except Exception:
-                pass
+        if response:
+            await safe_send(bot, chat_id,
+                f"{AGENTS['الباحث']['emoji']} الباحث:\n{response}")
+
+    save_msg(chat_id, "الفريق", f"تمت معالجة: {user_input[:60]}")
+    save_lesson(chat_id, f"نفّذنا: {user_input[:60]}")
 
 # ================================================================
-# 11. النقاش التلقائي المستمر
+# 10. الحلقة الرئيسية
 # ================================================================
-async def run_discussion(bot: Bot):
-    global discussion_active, discussion_history
-    topics = [
-        "مستقبل الذكاء الاصطناعي والوكلاء الذكيين",
-        "هل ستحل الروبوتات محل البشر في سوق العمل؟",
-        "الفرق بين الذكاء الاصطناعي العام والضيق",
-        "أخلاقيات الذكاء الاصطناعي وحدوده",
-        "مستقبل البرمجة مع وجود الذكاء الاصطناعي",
-    ]
-    topic = random.choice(topics)
-    discussion_history = [f"الموضوع: {topic}"]
-    await safe_send(bot, chat_id_global,
-        f"💬 بدأ النقاش التلقائي\nالموضوع: {topic}\n\nاكتب أي رسالة للتدخل")
+# حل مشكلة المتغيرات العامة - كل chat_id له state خاص
+user_states: dict[int, dict] = {}
 
-    while discussion_active:
-        agent = random.choice(AGENTS)
-        ctx   = "\n".join(discussion_history[-6:])
-        # أحياناً يبحث في الإنترنت ليضيف معلومة حقيقية
-        extra = ""
-        if random.random() < 0.15:
-            results = await web_search(topic, 2)
-            if results:
-                extra = f"\nمعلومة من الإنترنت:\n{results[:300]}"
-        
-        reply = await groq_call(
-            f"سياق النقاش:\n{ctx}{extra}\n\nشارك بجملتين ذكيتين من منظورك.",
-            f"أنت {agent['name']}، {agent['personality']}. تحدث بشكل عفوي. لا تقل اسمك.",
-            120, 0.9
-        )
-        if reply:
-            try:
-                await safe_send(bot, chat_id_global, f"{agent['emoji']} {agent['name']}:\n{reply}")
-                discussion_history.append(f"{agent['name']}: {reply}")
-                if len(discussion_history) > 25:
-                    discussion_history.pop(1)
-            except TelegramError as e:
-                print(f"Discussion TG error: {e}")
-                break
-        await asyncio.sleep(random.randint(20, 40))
-
-async def handle_discussion_msg(bot: Bot, chat_id: int, text: str):
-    discussion_history.append(f"المستخدم: {text}")
-    agent = random.choice(AGENTS)
-    ctx   = "\n".join(discussion_history[-5:])
-    search_ctx = await web_search(text, 3)
-    extra = f"\nمعلومة:\n{search_ctx[:400]}" if search_ctx else ""
-    reply = await groq_call(
-        f"السياق:\n{ctx}{extra}\n\nرد على المستخدم: {text}",
-        f"أنت {agent['name']}، {agent['personality']}. رد بشكل مباشر في 2-3 جمل.",
-        200
-    )
-    if reply:
-        await safe_send(bot, chat_id, f"{agent['emoji']} {agent['name']} يرد:\n{reply}")
-        discussion_history.append(f"{agent['name']}: {reply}")
-
-# ================================================================
-# 12. الحلقة الرئيسية
-# ================================================================
 async def main():
-    global discussion_active, discussion_task, chat_id_global
     init_db()
     bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -515,7 +517,7 @@ async def main():
     except Exception:
         pass
 
-    print("🚀 النظام جاهز: تعاون وكلاء + ذاكرة عميقة + RAG + Chain of Thought")
+    print("🚀 النظام جاهز: الباحث + المبرمج + المنفذ")
 
     while True:
         try:
@@ -530,8 +532,8 @@ async def main():
                 # --- صوت ---
                 if update.message.voice:
                     await safe_send(bot, chat_id, "🎙️ جاري فهم الرسالة الصوتية...")
-                    file      = await bot.get_file(update.message.voice.file_id)
-                    audio     = await file.download_as_bytearray()
+                    file        = await bot.get_file(update.message.voice.file_id)
+                    audio       = await file.download_as_bytearray()
                     transcribed = await transcribe_voice(bytes(audio))
                     if transcribed:
                         await safe_send(bot, chat_id, f"🎙️ فهمت: {transcribed}")
@@ -543,30 +545,29 @@ async def main():
                 # --- صور ---
                 if update.message.photo:
                     await safe_send(bot, chat_id, "🖼️ جاري تحليل الصورة...")
-                    file  = await bot.get_file(update.message.photo[-1].file_id)
-                    img   = await file.download_as_bytearray()
-                    q     = update.message.caption or "صف هذه الصورة بالتفصيل"
+                    file     = await bot.get_file(update.message.photo[-1].file_id)
+                    img      = await file.download_as_bytearray()
+                    q        = update.message.caption or "صف هذه الصورة بالتفصيل"
                     analysis = await analyze_image(bytes(img), q)
                     if analysis:
                         await safe_send(bot, chat_id, f"🖼️ تحليل الصورة:\n\n{analysis}")
                         save_msg(chat_id, "تحليل صورة", analysis)
                     continue
 
-                # --- مستند / ملف نصي → RAG ---
+                # --- مستند → RAG ---
                 if update.message.document:
                     doc = update.message.document
-                    if doc.mime_type in ("text/plain",):
-                        await safe_send(bot, chat_id, "📄 جاري حفظ المستند في قاعدة المعرفة...")
+                    if doc.mime_type == "text/plain":
+                        await safe_send(bot, chat_id, "📄 جاري حفظ المستند...")
                         file    = await bot.get_file(doc.file_id)
                         content = (await file.download_as_bytearray()).decode("utf-8", errors="ignore")
                         title   = doc.file_name or "مستند"
                         added   = save_knowledge(chat_id, title, content)
-                        if added:
-                            await safe_send(bot, chat_id, f"✅ تم حفظ '{title}' في قاعدة المعرفة!\nيمكنني الآن الإجابة عن أسئلة تتعلق بمحتواه.")
-                        else:
-                            await safe_send(bot, chat_id, "ℹ️ هذا المستند موجود بالفعل في قاعدة المعرفة.")
+                        msg = (f"✅ تم حفظ '{title}' في قاعدة المعرفة!"
+                               if added else "ℹ️ هذا المستند موجود بالفعل.")
+                        await safe_send(bot, chat_id, msg)
                     else:
-                        await safe_send(bot, chat_id, "⚠️ أدعم الملفات النصية (.txt) فقط حالياً.")
+                        await safe_send(bot, chat_id, "⚠️ أدعم الملفات النصية (.txt) فقط.")
                     continue
 
                 if not text:
@@ -574,81 +575,39 @@ async def main():
 
                 # --- الأوامر ---
                 if text == "/start":
-                    chat_id_global = chat_id
-                    recent = get_recent_msgs(chat_id, 2)
-                    greet  = "مرحباً من جديد! لا أزال أتذكر محادثاتنا 🧠" if recent else "مرحباً! أنا وكيلك الذكي المتطور 🤖"
-                    await safe_send(bot, chat_id, f"""{greet}
+                    await safe_send(bot, chat_id, f"""مرحباً! أنا نظام الوكلاء الثلاثة 🤖
 
-قدراتي:
-• تعاون حقيقي بين 5 وكلاء لكل سؤال صعب
-• ذاكرة دائمة مع تلخيص تلقائي كل 20 رسالة
-• قاعدة معرفة شخصية (أرسل ملف .txt لأحفظه)
-• تفكير عميق متعدد المراحل
-• بحث في الإنترنت تلقائياً
-• فهم الصوت وتحليل الصور
-• جلب الصور من الإنترنت
+🔍 الباحث - يلخص ويبحث في الإنترنت
+💻 المبرمج - يكتب كوداً نظيفاً بدون أخطاء
+⚡ المنفذ  - ينفذ الكود ويشغل الأوامر فعلياً
 
 الأوامر:
-/agent  - وضع الوكيل الذكي
-/discuss - وضع النقاش التلقائي
-/knowledge - قاعدة معرفتي
-/memory - ذاكرتي عنك
-/status - حالة النظام
-/clear  - مسح كل شيء
-/stop   - إيقاف النقاش
+/status   - حالة النظام
+/knowledge - قاعدة المعرفة
+/memory   - الذاكرة
+/clear    - مسح كل شيء
 
-أرسل نصاً أو صوتاً أو صورة أو ملف .txt وسأتعامل معها!""")
-
-                elif text == "/agent":
-                    discussion_active = False
-                    if discussion_task and not discussion_task.done():
-                        discussion_task.cancel()
-                    await safe_send(bot, chat_id, "🧠 وضع الوكيل الذكي مفعّل\n\nأرسل أي سؤال صعب وسيناقشه الفريق كاملاً قبل الإجابة!")
-
-                elif text == "/discuss":
-                    chat_id_global = chat_id
-                    discussion_active = True
-                    if discussion_task is None or discussion_task.done():
-                        discussion_task = asyncio.create_task(run_discussion(bot))
-                    else:
-                        await safe_send(bot, chat_id, "النقاش يعمل بالفعل!")
+أرسل أي طلب برمجي وسيتعاون الفريق لإنجازه!""")
 
                 elif text == "/knowledge":
                     docs = list_knowledge(chat_id)
                     if docs:
-                        msg = "📚 قاعدة معرفتي:\n\n" + "\n".join(f"{i+1}. {d[1]}" for i, d in enumerate(docs))
+                        msg = "📚 قاعدة المعرفة:\n\n" + "\n".join(
+                            f"{i+1}. {d[1]}" for i, d in enumerate(docs))
                         await safe_send(bot, chat_id, msg)
                     else:
-                        await safe_send(bot, chat_id, "📚 قاعدة المعرفة فارغة.\nأرسل ملف .txt لإضافته!")
+                        await safe_send(bot, chat_id, "📚 فارغة. أرسل ملف .txt لإضافته!")
 
                 elif text == "/memory":
                     ctx = build_context(chat_id)
-                    await safe_send(bot, chat_id, f"🧠 ذاكرتي:\n\n{ctx[:2500]}" if ctx else "🧠 الذاكرة فارغة.")
+                    await safe_send(bot, chat_id,
+                        f"🧠 الذاكرة:\n\n{ctx[:2500]}" if ctx else "🧠 الذاكرة فارغة.")
 
                 elif text == "/clear":
                     clear_all(chat_id)
-                    discussion_history.clear()
                     await safe_send(bot, chat_id, "🗑️ تم مسح كل شيء.")
 
-                elif text == "/stop":
-                    discussion_active = False
-                    if discussion_task and not discussion_task.done():
-                        discussion_task.cancel()
-                    await safe_send(bot, chat_id, "⏹ توقف النقاش.\n/discuss لإعادته\n/agent للوكيل الذكي")
-
-                elif text == "/topic":
-                    if discussion_active:
-                        discussion_active = False
-                        if discussion_task and not discussion_task.done():
-                            discussion_task.cancel()
-                        await asyncio.sleep(1)
-                        discussion_active = True
-                        discussion_task = asyncio.create_task(run_discussion(bot))
-                    else:
-                        await safe_send(bot, chat_id, "أرسل /discuss أولاً.")
-
                 elif text == "/status":
-                    mode = "نقاش نشط 🟢" if discussion_active else "وكيل ذكي 🔵"
                     conn = sqlite3.connect(DB_PATH)
                     c    = conn.cursor()
                     c.execute("SELECT COUNT(*) FROM messages  WHERE chat_id=?", (chat_id,))
@@ -657,27 +616,21 @@ async def main():
                     sums = c.fetchone()[0]
                     c.execute("SELECT COUNT(*) FROM knowledge WHERE chat_id=?", (chat_id,))
                     docs = c.fetchone()[0]
-                    c.execute("SELECT COUNT(*) FROM lessons   WHERE chat_id=?", (chat_id,))
-                    lsns = c.fetchone()[0]
                     conn.close()
-                    await safe_send(bot, chat_id, f"""حالة النظام:
+                    await safe_send(bot, chat_id, f"""📊 حالة النظام:
 
-الوضع: {mode}
+الوكلاء: الباحث 🔍 | المبرمج 💻 | المنفذ ⚡
 الرسائل المحفوظة: {msgs}
 الملخصات: {sums}
 مستندات RAG: {docs}
-دروس مستفادة: {lsns}
 
 النماذج:
-• LLaMA 3.3 70B  - التفكير والنصوص
+• LLaMA 3.3 70B  - التفكير والكود
 • Whisper Large  - الصوت
 • LLaMA 4 Scout  - الصور""")
 
                 else:
-                    if discussion_active:
-                        await handle_discussion_msg(bot, chat_id, text)
-                    else:
-                        await master_agent(bot, chat_id, text)
+                    await master_agent(bot, chat_id, text)
 
         except TelegramError as e:
             print(f"Telegram error: {e}")
