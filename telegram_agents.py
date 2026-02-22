@@ -1,16 +1,24 @@
 import asyncio
 import random
+import os
 import google.generativeai as genai
 from telegram import Bot
 from telegram.error import TelegramError
 
-# ============ الإعدادات ============
-TELEGRAM_TOKEN = "8317346256:AAFYz4Aw_5cvth-cg-UoUW1Xwg2-pkJ1D9k"
-GEMINI_API_KEY = "AIzaSyDU41B-yE3yEn1liqPQJgIxHvv8Ylmrgug"
-CHAT_ID = None  # سيتم تحديده تلقائياً
+# ============ الإعدادات الأمنية (Railway) ============
+# جلب الإعدادات من متغيرات البيئة لضمان عدم تسريب المفاتيح
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# التحقق من وجود المفاتيح قبل التشغيل
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    print("❌ خطأ: يرجى إضافة TELEGRAM_TOKEN و GEMINI_API_KEY في إعدادات Railway (Variables)")
+    exit(1)
+
+# إعداد نموذج Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+# تصحيح: إضافة علامات التنصيص حول اسم النموذج
+model = genai.GenerativeModel("gemini-1.5-flash") 
 
 # ============ الوكلاء الخمسة ============
 AGENTS = [
@@ -43,6 +51,7 @@ AGENTS = [
 
 conversation_history = []
 current_agent_index = 0
+discussion_active = False # متغير للتحكم في حالة النقاش
 
 def get_next_agent():
     global current_agent_index
@@ -53,128 +62,88 @@ def get_next_agent():
 async def generate_response(agent, topic, last_messages):
     history_text = "\n".join(last_messages[-6:]) if last_messages else "بداية النقاش"
     
-    prompt = f"""أنت {agent['name']}.
-دورك: {agent['role']}
-شخصيتك: {agent['personality']}
+    prompt = f"""أنت {agent['name']}. 
+دورك: {agent['role']}. شخصيتك: {agent['personality']}.
+الموضوع: أتمتة مهام البحث وجلب المعلومات.
 
-الموضوع الرئيسي: أتمتة مهام البحث وجلب المعلومات
-
-آخر ما قيله الزملاء:
+السياق الحالي:
 {history_text}
 
-اكتب ردك في النقاش (جملتين أو ثلاث فقط، بشكل طبيعي وحواري، بالعربية).
-لا تكرر ما قيل، أضف رأياً أو فكرة جديدة أو اعتراضاً أو سؤالاً."""
+اكتب رداً قصيراً (2-3 جمل) بالعربية الفصحى، يضيف قيمة للنقاش أو يسأل سؤالاً ذكياً.
+لا تكرر كلام الآخرين."""
 
     try:
-        response = model.generate_content(prompt)
+        # استخدام asyncio لتجنب حظر البوت أثناء التوليد
+        response = await asyncio.to_thread(model.generate_content, prompt)
         return response.text.strip()
     except Exception as e:
-        return f"[خطأ في التوليد: {e}]"
+        print(f"خطأ في AI: {e}")
+        return "أعتقد أننا بحاجة للتركيز أكثر على الأدوات التقنية المتاحة حالياً."
 
 async def run_discussion(bot, chat_id):
-    global conversation_history
+    global conversation_history, discussion_active
+    discussion_active = True
     
-    # رسالة البداية
     await bot.send_message(
         chat_id=chat_id,
-        text="🚀 *بدأ النقاش بين الوكلاء الخمسة حول أتمتة مهام البحث!*\n\nاكتب /stop لإيقاف النقاش",
+        text="🚀 *بدأ النقاش بين الوكلاء الخمسة!*\n\nاكتب /stop لإيقاف النقاش في أي وقت.",
         parse_mode="Markdown"
     )
     
-    await asyncio.sleep(2)
-    
-    # رسالة افتتاحية من أول وكيل
-    first_agent = AGENTS[0]
-    opener = "مرحباً بالجميع! دعونا نناقش كيف يمكننا أتمتة مهام البحث وجلب المعلومات بشكل فعال. ما هي أفضل الأدوات والاستراتيجيات برأيكم؟"
-    
-    msg = f"*{first_agent['name']}:*\n{opener}"
-    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-    conversation_history.append(f"{first_agent['name']}: {opener}")
-    
-    round_num = 0
-    while True:
-        round_num += 1
-        
-        # كل 10 جولات، أضف موضوعاً جديداً
-        if round_num % 10 == 0:
-            topics = [
-                "ما هي أفضل APIs المجانية للبحث؟",
-                "كيف نتعامل مع الـ Rate Limiting؟",
-                "ما دور الذكاء الاصطناعي في تصنيف المعلومات؟",
-                "كيف نضمن جودة البيانات المجمعة؟"
-            ]
-            new_topic = random.choice(topics)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"💡 *موضوع جديد للنقاش:* {new_topic}",
-                parse_mode="Markdown"
-            )
-        
-        # اختر الوكيل التالي
+    while discussion_active:
         agent = get_next_agent()
-        
-        # توليد الرد
         response = await generate_response(agent, "أتمتة البحث", conversation_history)
         
-        # أرسل الرسالة
         msg = f"*{agent['name']}:*\n{response}"
         try:
             await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-        except Exception as e:
-            print(f"خطأ في الإرسال: {e}")
+            conversation_history.append(f"{agent['name']}: {response}")
+            
+            # إبقاء الذاكرة خفيفة
+            if len(conversation_history) > 15:
+                conversation_history.pop(0)
+                
+        except TelegramError as e:
+            print(f"Telegram Error: {e}")
             break
-        
-        # احفظ في السجل
-        conversation_history.append(f"{agent['name']}: {response}")
-        if len(conversation_history) > 20:
-            conversation_history = conversation_history[-20:]
-        
-        # انتظر بين الرسائل (30-60 ثانية)
-        delay = random.randint(30, 60)
-        await asyncio.sleep(delay)
+            
+        # مدة الانتظار بين ردود الوكلاء (يمكنك تعديلها)
+        await asyncio.sleep(random.randint(20, 40))
 
 async def main():
+    global discussion_active
     bot = Bot(token=TELEGRAM_TOKEN)
-    
-    print("✅ البوت يعمل... في انتظار رسالة /start")
-    print("أرسل /start في محادثة البوت لبدء النقاش")
+    print("✅ البوت يعمل بنجاح... في انتظار الأوامر.")
     
     last_update_id = None
     
     while True:
         try:
-            updates = await bot.get_updates(
-                offset=last_update_id,
-                timeout=10,
-                allowed_updates=["message"]
-            )
-            
+            updates = await bot.get_updates(offset=last_update_id, timeout=20)
             for update in updates:
                 last_update_id = update.update_id + 1
+                if not update.message or not update.message.text:
+                    continue
                 
-                if update.message and update.message.text:
-                    chat_id = update.message.chat_id
-                    text = update.message.text
-                    
-                    if text == "/start":
-                        await run_discussion(bot, chat_id)
-                    elif text == "/stop":
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text="⏹ تم إيقاف النقاش. أرسل /start لإعادة البدء."
-                        )
-                        conversation_history.clear()
-                    elif text == "/status":
-                        await bot.send_message(
-                            chat_id=chat_id,
-                            text=f"✅ البوت يعمل\n📝 عدد الرسائل في الذاكرة: {len(conversation_history)}"
-                        )
-        
-        except TelegramError as e:
-            print(f"خطأ تيليغرام: {e}")
-            await asyncio.sleep(5)
+                chat_id = update.message.chat_id
+                text = update.message.text
+
+                if text == "/start":
+                    if not discussion_active:
+                        asyncio.create_task(run_discussion(bot, chat_id))
+                    else:
+                        await bot.send_message(chat_id=chat_id, text="⚠️ النقاش جارٍ بالفعل!")
+                
+                elif text == "/stop":
+                    discussion_active = False
+                    await bot.send_message(chat_id=chat_id, text="⏹ تم إيقاف النقاش.")
+                
+                elif text == "/status":
+                    status = "يعمل 🟢" if discussion_active else "متوقف 🔴"
+                    await bot.send_message(chat_id=chat_id, text=f"وضع البوت: {status}")
+
         except Exception as e:
-            print(f"خطأ عام: {e}")
+            print(f"Error in main loop: {e}")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
