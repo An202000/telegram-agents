@@ -183,10 +183,7 @@ def clear_all(chat_id):
 # ================================================================
 # 4. أدوات مساعدة
 # ================================================================
-def truncate(text: str, max_chars: int = 6000) -> str:
-    if len(text) > max_chars:
-        return text[:max_chars] + "\n... [تم اختصار السياق]"
-    return text
+
 
 async def safe_send(bot: Bot, chat_id: int, text: str):
     if not text:
@@ -274,7 +271,7 @@ def build_context(chat_id: int, query: str = "") -> str:
     recent = get_recent_msgs(chat_id, 10)
     if recent:
         ctx += f"=== المحادثة الأخيرة ===\n{recent}\n"
-    return truncate(ctx, 5000)
+    return ctx
 
 # ================================================================
 # 6. تلخيص تلقائي كل 20 رسالة
