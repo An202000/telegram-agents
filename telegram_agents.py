@@ -10,7 +10,7 @@ GEMINI_API_KEY = "AIzaSyDU41B-yE3yEn1liqPQJgIxHvv8Ylmrgug"
 CHAT_ID = None  # سيتم تحديده تلقائياً
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel(gemini-2.0-flash)
 
 # ============ الوكلاء الخمسة ============
 AGENTS = [
